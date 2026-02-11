@@ -1,5 +1,5 @@
 """
-Dagster job que ejecuta un ejemplo de Spark con schedule (cron)
+Dagster job que ejecuta un ejemplo de Spark usando Spark Operator en Kubernetes
 """
 from dagster import (
     asset,
@@ -8,160 +8,279 @@ from dagster import (
     ScheduleDefinition,
     Definitions,
 )
-import subprocess
+from kubernetes import client, config
 import os
+import time
 from datetime import datetime
+from typing import Dict
 
 
-# Configuración de Spark para K3s
-# El spark-submit debe existir en la máquina local para enviar jobs al cluster K3s
-SPARK_SUBMIT = os.environ.get("SPARK_SUBMIT", "spark-submit")
-
-# Configuración del cluster K3s
-# K3s por defecto usa el puerto 6443
-K8S_MASTER = os.environ.get("SPARK_K8S_MASTER", "k8s://https://127.0.0.1:6443")
-SPARK_NAMESPACE = os.environ.get("SPARK_NAMESPACE", "default")
+# Configuración del Spark Operator en K8s
+SPARK_NAMESPACE = os.environ.get("SPARK_NAMESPACE", "data-systems")
+SPARK_IMAGE = os.environ.get("SPARK_IMAGE", "apache/spark:3.5.1")
 SPARK_SERVICE_ACCOUNT = os.environ.get("SPARK_SERVICE_ACCOUNT", "spark")
+SPARK_EXAMPLES_JAR = "local:///opt/spark/examples/jars/spark-examples_2.12-3.5.1.jar"
 
-# Imagen Docker de Spark para K3s
-# Puede usar imágenes del registry local de K3s o public registries
-SPARK_IMAGE = os.environ.get("SPARK_IMAGE", "apache/spark:latest")
 
-# Ejemplo por defecto de Spark - usar URL local o remoto del JAR
-SPARK_EXAMPLES_JAR = os.environ.get("SPARK_EXAMPLES_JAR", "local:///opt/spark/examples/jars/spark-examples.jar")
+def create_spark_application_manifest(
+    name: str,
+    main_class: str,
+    args: list = None,
+    driver_memory: str = "512m",
+    executor_memory: str = "768m",
+    executor_instances: int = 1,
+) -> Dict:
+    """
+    Crea un manifest de SparkApplication para el Spark Operator
+    
+    Args:
+        name: Nombre de la aplicación
+        main_class: Clase principal de Spark a ejecutar
+        args: Argumentos para la aplicación
+        driver_memory: Memoria del driver
+        executor_memory: Memoria de los executors
+        executor_instances: Número de executors
+    
+    Returns:
+        Dict: Manifest de SparkApplication
+    """
+    manifest = {
+        "apiVersion": "sparkoperator.k8s.io/v1beta2",
+        "kind": "SparkApplication",
+        "metadata": {
+            "name": name,
+            "namespace": SPARK_NAMESPACE
+        },
+        "spec": {
+            "type": "Scala",
+            "mode": "cluster",
+            "image": SPARK_IMAGE,
+            "imagePullPolicy": "IfNotPresent",
+            "mainClass": main_class,
+            "mainApplicationFile": SPARK_EXAMPLES_JAR,
+            "sparkVersion": "3.5.1",
+            "arguments": args or [],
+            "sparkConf": {
+                "spark.ui.port": "4040"
+            },
+            "restartPolicy": {
+                "type": "Never"
+            },
+            "driver": {
+                "cores": 1,
+                "memory": driver_memory,
+                "serviceAccount": SPARK_SERVICE_ACCOUNT,
+                "labels": {"app": "spark"},
+                "nodeSelector": {
+                    "kubernetes.io/arch": "arm64"
+                }
+            },
+            "executor": {
+                "instances": executor_instances,
+                "cores": 1,
+                "memory": executor_memory,
+                "nodeSelector": {
+                    "kubernetes.io/arch": "arm64"
+                }
+            }
+        }
+    }
+    
+    return manifest
+
+
+def submit_spark_application(context: AssetExecutionContext, manifest: Dict, app_name: str) -> Dict:
+    """
+    Envía una SparkApplication al cluster usando Kubernetes Python Client
+    
+    Args:
+        context: Contexto de Dagster
+        manifest: Manifest de SparkApplication
+        app_name: Nombre de la aplicación
+    
+    Returns:
+        Dict con información de la ejecución
+    """
+    try:
+        # Cargar configuración in-cluster (usa ServiceAccount automáticamente)
+        config.load_incluster_config()
+        
+        # Crear cliente de CustomObjects para CRDs
+        api = client.CustomObjectsApi()
+        
+        # Crear el recurso SparkApplication
+        context.log.info(f"📝 Creando SparkApplication: {app_name}")
+        api.create_namespaced_custom_object(
+            group="sparkoperator.k8s.io",
+            version="v1beta2",
+            namespace=SPARK_NAMESPACE,
+            plural="sparkapplications",
+            body=manifest
+        )
+        
+        context.log.info(f"✅ SparkApplication creada exitosamente")
+        
+        # Esperar y monitorear el estado
+        context.log.info(f"⏳ Monitoreando ejecución de {app_name}...")
+        
+        max_wait = 300  # 5 minutos
+        start_time = time.time()
+        
+        while (time.time() - start_time) < max_wait:
+            try:
+                # Obtener estado de la SparkApplication
+                spark_app = api.get_namespaced_custom_object(
+                    group="sparkoperator.k8s.io",
+                    version="v1beta2",
+                    namespace=SPARK_NAMESPACE,
+                    plural="sparkapplications",
+                    name=app_name
+                )
+                
+                state = spark_app.get("status", {}).get("applicationState", {}).get("state", "UNKNOWN")
+                elapsed = int(time.time() - start_time)
+                context.log.info(f"📊 Estado: {state} (transcurridos {elapsed}s)")
+                
+                if state == "COMPLETED":
+                    context.log.info(f"✅ SparkApplication {app_name} completada exitosamente!")
+                    return {
+                        "status": "success",
+                        "app_name": app_name,
+                        "state": state,
+                        "namespace": SPARK_NAMESPACE,
+                        "elapsed_seconds": elapsed
+                    }
+                elif state in ["FAILED", "SUBMISSION_FAILED", "INVALIDATING", "UNKNOWN"]:
+                    context.log.error(f"❌ SparkApplication {app_name} falló con estado: {state}")
+                    
+                    # Intentar obtener logs del driver
+                    context.log.info("📋 Buscando logs del driver...")
+                    try:
+                        core_api = client.CoreV1Api()
+                        pods = core_api.list_namespaced_pod(
+                            namespace=SPARK_NAMESPACE,
+                            label_selector=f"sparkoperator.k8s.io/app-name={app_name},spark-role=driver"
+                        )
+                        
+                        if pods.items:
+                            driver_pod = pods.items[0]
+                            logs = core_api.read_namespaced_pod_log(
+                                name=driver_pod.metadata.name,
+                                namespace=SPARK_NAMESPACE,
+                                tail_lines=50
+                            )
+                            context.log.error("📋 Últimos logs del driver:")
+                            for line in logs.split('\n')[-30:]:
+                                if line.strip():
+                                    context.log.error(line)
+                    except Exception as log_error:
+                        context.log.warning(f"No se pudieron obtener logs: {log_error}")
+                    
+                    raise Exception(f"SparkApplication falló con estado: {state}")
+                
+                # Estados en progreso
+                elif state in ["SUBMITTED", "RUNNING", "PENDING_RERUN", "SUCCEEDING"]:
+                    time.sleep(10)
+                    continue
+                    
+            except client.exceptions.ApiException as e:
+                if e.status == 404:
+                    context.log.warning(f"SparkApplication {app_name} no encontrada aún, esperando...")
+                    time.sleep(5)
+                    continue
+                raise
+            
+            time.sleep(5)
+        
+        # Timeout
+        context.log.error(f"⏰ Timeout esperando completación de {app_name}")
+        raise Exception(f"SparkApplication no completó en {max_wait} segundos")
+        
+    except Exception as e:
+        context.log.error(f"❌ Error: {str(e)}")
+        raise
+    finally:
+        # Limpiar: eliminar la SparkApplication
+        context.log.info(f"🧹 Limpiando SparkApplication {app_name}...")
+        try:
+            api.delete_namespaced_custom_object(
+                group="sparkoperator.k8s.io",
+                version="v1beta2",
+                namespace=SPARK_NAMESPACE,
+                plural="sparkapplications",
+                name=app_name
+            )
+        except Exception as cleanup_error:
+            context.log.warning(f"Error durante limpieza: {cleanup_error}")
 
 
 @asset
 def execute_spark_pi_job(context: AssetExecutionContext) -> dict:
     """
-    Ejecuta el job de ejemplo SparkPi de Spark
+    Ejecuta el job de ejemplo SparkPi usando Spark Operator
     
     El ejemplo SparkPi calcula el valor de Pi usando el método Monte Carlo.
     
     Returns:
-        dict: Resultado de la ejecución con stdout, stderr y código de salida
+        dict: Resultado de la ejecución
     """
     context.log.info("="*80)
     context.log.info("🚀 Iniciando ejecución de Spark Job - SparkPi")
+    context.log.info(f"☸️  Usando Spark Operator en namespace: {SPARK_NAMESPACE}")
+    context.log.info(f"🐳 Imagen: {SPARK_IMAGE}")
     context.log.info("="*80)
     
-    # Comando spark-submit para Kubernetes
-    # Ejecuta el ejemplo SparkPi con 100 particiones en el cluster K8s
-    command = [
-        SPARK_SUBMIT,
-        "--master", K8S_MASTER,
-        "--deploy-mode", "cluster",
-        "--name", "SparkPi-Dagster-Job",
-        "--class", "org.apache.spark.examples.SparkPi",
-        "--conf", f"spark.kubernetes.namespace={SPARK_NAMESPACE}",
-        "--conf", f"spark.kubernetes.container.image={SPARK_IMAGE}",
-        "--conf", f"spark.kubernetes.authenticate.driver.serviceAccountName={SPARK_SERVICE_ACCOUNT}",
-        "--conf", "spark.executor.instances=2",
-        "--conf", "spark.executor.memory=1g",
-        "--conf", "spark.executor.cores=1",
-        "--conf", "spark.driver.memory=1g",
-        SPARK_EXAMPLES_JAR,
-        "100"  # Número de particiones para el cálculo
-    ]
+    app_name = f"spark-pi-dagster-{int(time.time())}"
     
-    context.log.info(f"📝 Comando a ejecutar:")
-    context.log.info(f"   {' '.join(command)}")
+    # Crear manifest de SparkApplication
+    manifest = create_spark_application_manifest(
+        name=app_name,
+        main_class="org.apache.spark.examples.SparkPi",
+        args=["100"],  # Número de particiones
+        driver_memory="512m",
+        executor_memory="768m",
+        executor_instances=1
+    )
+    
+    context.log.info("📄 Manifest de SparkApplication:")
+    context.log.info("-"*80)
+    context.log.info(f"  Nombre: {app_name}")
+    context.log.info(f"  Clase: {manifest['spec']['mainClass']}")
+    context.log.info(f"  Argumentos: {manifest['spec']['arguments']}")
+    context.log.info(f"  Driver: {manifest['spec']['driver']['memory']}, {manifest['spec']['driver']['cores']} cores")
+    context.log.info(f"  Executors: {manifest['spec']['executor']['instances']} x {manifest['spec']['executor']['memory']}")
+    context.log.info("-"*80)
+    
+    # Enviar SparkApplication
+    start_time = datetime.now()
+    context.log.info(f"⏰ Hora de inicio: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    result = submit_spark_application(context, manifest, app_name)
+    
+    end_time = datetime.now()
+    duration = (end_time - start_time).total_seconds()
+    
     context.log.info("")
+    context.log.info("="*80)
+    context.log.info("📊 RESULTADO DE LA EJECUCIÓN")
+    context.log.info("="*80)
+    context.log.info(f"⏰ Hora de finalización: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    context.log.info(f"⏱️  Duración: {duration:.2f} segundos")
+    context.log.info(f"✅ SparkApplication: {app_name}")
+    context.log.info("="*80)
     
-    try:
-        context.log.info(f"📦 Usando JAR: {SPARK_EXAMPLES_JAR}")
-        context.log.info(f"☸️  Cluster K3s: {K8S_MASTER}")
-        context.log.info(f"📦 Namespace: {SPARK_NAMESPACE}")
-        context.log.info(f"🐳 Imagen: {SPARK_IMAGE}")
-        
-        # Ejecutar el comando
-        start_time = datetime.now()
-        context.log.info(f"⏰ Hora de inicio: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=300  # timeout de 5 minutos
-        )
-        
-        end_time = datetime.now()
-        duration = (end_time - start_time).total_seconds()
-        
-        context.log.info("")
-        context.log.info("="*80)
-        context.log.info("📊 RESULTADO DE LA EJECUCIÓN")
-        context.log.info("="*80)
-        context.log.info(f"⏰ Hora de finalización: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        context.log.info(f"⏱️  Duración: {duration:.2f} segundos")
-        context.log.info(f"✅ Código de salida: {result.returncode}")
-        context.log.info("")
-        
-        # Mostrar stdout
-        if result.stdout:
-            context.log.info("📤 STDOUT:")
-            context.log.info("-"*80)
-            for line in result.stdout.split('\n'):
-                context.log.info(line)
-            context.log.info("-"*80)
-        
-        # Mostrar stderr (Spark escribe logs en stderr)
-        if result.stderr:
-            context.log.info("")
-            context.log.info("📋 LOGS DE SPARK:")
-            context.log.info("-"*80)
-            # Filtrar líneas importantes
-            for line in result.stderr.split('\n'):
-                if 'Pi is roughly' in line or 'ERROR' in line or 'INFO SparkContext' in line:
-                    context.log.info(line)
-            context.log.info("-"*80)
-        
-        # Verificar si fue exitoso
-        if result.returncode == 0:
-            context.log.info("")
-            context.log.info("✅ Job de Spark ejecutado exitosamente!")
-            
-            # Intentar extraer el resultado de Pi
-            pi_value = None
-            for line in result.stdout.split('\n'):
-                if 'Pi is roughly' in line:
-                    context.log.info(f"🎯 {line}")
-                    # Extraer el valor
-                    pi_value = line.split('roughly')[1].strip()
-                    break
-            
-            return {
-                "status": "success",
-                "exit_code": result.returncode,
-                "duration_seconds": duration,
-                "pi_value": pi_value,
-                "start_time": start_time.isoformat(),
-                "end_time": end_time.isoformat(),
-                "stdout": result.stdout,
-                "stderr": result.stderr
-            }
-        else:
-            context.log.error("")
-            context.log.error("❌ Error en la ejecución del job de Spark")
-            raise Exception(f"Spark job falló con código de salida: {result.returncode}")
-            
-    except subprocess.TimeoutExpired:
-        context.log.error("⏰ El job de Spark excedió el tiempo límite de ejecución")
-        raise
-    except FileNotFoundError as e:
-        context.log.error(f"❌ Error: {str(e)}")
-        context.log.error(f"💡 Verifica que SPARK_HOME esté configurado correctamente: {SPARK_HOME}")
-        raise
-    except Exception as e:
-        context.log.error(f"❌ Error inesperado: {str(e)}")
-        raise
+    result["duration_seconds"] = duration
+    result["start_time"] = start_time.isoformat()
+    result["end_time"] = end_time.isoformat()
+    
+    return result
 
 
 # Definir el job que ejecuta el asset
 spark_pi_job = define_asset_job(
     name="spark_pi_job",
     selection="execute_spark_pi_job",
-    description="Job que ejecuta el ejemplo SparkPi de Spark"
+    description="Job que ejecuta el ejemplo SparkPi usando Spark Operator"
 )
 
 
