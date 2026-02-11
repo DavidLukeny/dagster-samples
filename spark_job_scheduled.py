@@ -121,10 +121,13 @@ def submit_spark_application(context: AssetExecutionContext, manifest: Dict, app
         context.log.info(f"✅ SparkApplication creada exitosamente")
         
         # Esperar y monitorear el estado
-        context.log.info(f"⏳ Monitoreando ejecución de {app_name}...")
+        context.log.info(f"⏳ Esperando a que el Spark Operator procese la aplicación...")
+        time.sleep(15)  # Dar tiempo al operator para inicializar
         
+        context.log.info(f"⏳ Monitoreando ejecución de {app_name}...")
         max_wait = 300  # 5 minutos
         start_time = time.time()
+        unknown_count = 0
         
         while (time.time() - start_time) < max_wait:
             try:
@@ -137,8 +140,15 @@ def submit_spark_application(context: AssetExecutionContext, manifest: Dict, app
                     name=app_name
                 )
                 
-                state = spark_app.get("status", {}).get("applicationState", {}).get("state", "UNKNOWN")
+                state = spark_app.get("status", {}).get("applicationState", {}).get("state", "")
                 elapsed = int(time.time() - start_time)
+                
+                # Si no hay estado todavía, es normal al inicio
+                if not state or state == "":
+                    context.log.info(f"📊 Estado: pendiente (transcurridos {elapsed}s)")
+                    time.sleep(10)
+                    continue
+                    
                 context.log.info(f"📊 Estado: {state} (transcurridos {elapsed}s)")
                 
                 if state == "COMPLETED":
@@ -150,7 +160,15 @@ def submit_spark_application(context: AssetExecutionContext, manifest: Dict, app
                         "namespace": SPARK_NAMESPACE,
                         "elapsed_seconds": elapsed
                     }
-                elif state in ["FAILED", "SUBMISSION_FAILED", "INVALIDATING", "UNKNOWN"]:
+                elif state == "UNKNOWN":
+                    unknown_count += 1
+                    if unknown_count > 10:  # Después de 10 intentos con UNKNOWN, fallar
+                        context.log.error(f"❌ Estado UNKNOWN persistente después de {unknown_count} intentos")
+                        raise Exception(f"SparkApplication en estado UNKNOWN por mucho tiempo")
+                    context.log.warning(f"⚠️  Estado: UNKNOWN (intento {unknown_count}/10)")
+                    time.sleep(10)
+                    continue
+                elif state in ["FAILED", "SUBMISSION_FAILED", "INVALIDATING"]:
                     context.log.error(f"❌ SparkApplication {app_name} falló con estado: {state}")
                     
                     # Intentar obtener logs del driver
